@@ -1,0 +1,1 @@
+"""Maggie core package."""
