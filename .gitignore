@@ -8,3 +8,7 @@ venv/
 .tasks/
 .team/
 .worktrees/
+.sessions
+.transcripts
+tests
+explain
