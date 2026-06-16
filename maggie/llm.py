@@ -127,8 +127,41 @@ class ChatClient:
                     input=parsed_arguments,
                 )
             )
-        stop_reason = "tool_use" if choice.get("finish_reason") == "tool_calls" else choice.get("finish_reason", "stop")
+        # Some OpenAI-compatible providers return tool_calls with a non-tool finish_reason.
+        # Treat any response containing tool calls as a tool round to avoid persisting
+        # dangling assistant tool calls without matching tool results.
+        stop_reason = "tool_use" if message.get("tool_calls") else choice.get("finish_reason", "stop")
         return ModelResponse(content=content, stop_reason=stop_reason)
+
+
+class EmbeddingClient:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        payload = {
+            "model": self.settings.embedding_model,
+            "input": texts,
+            "encoding_format": "float",
+        }
+        if self.settings.embedding_dimensions > 0:
+            payload["dimensions"] = self.settings.embedding_dimensions
+        data = _post_json(
+            url=f"{self.settings.embedding_base_url}/embeddings",
+            headers={
+                "content-type": "application/json",
+                "authorization": f"Bearer {self.settings.embedding_api_key}",
+            },
+            payload=payload,
+        )
+        vectors: list[list[float]] = []
+        for item in sorted(data.get("data", []), key=lambda part: part.get("index", 0)):
+            embedding = item.get("embedding")
+            if isinstance(embedding, list):
+                vectors.append([float(value) for value in embedding])
+        if len(vectors) != len(texts):
+            raise RuntimeError("Embedding response size mismatch")
+        return vectors
 
 
 def _to_openai_messages(system: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
