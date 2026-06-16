@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import subprocess
@@ -8,7 +8,6 @@ from typing import Any
 from .skills import SkillLoader
 from .tasks import TaskManager
 from .todo import TodoManager
-from .worktrees import WorktreeManager
 
 
 DANGEROUS_PATTERNS = ['rm -rf /', 'sudo', 'shutdown', 'reboot', '> /dev/']
@@ -141,7 +140,7 @@ TASK_CREATE_TOOL = {
 
 TASK_UPDATE_TOOL = {
     'name': 'task_update',
-    'description': 'Update a persistent task status, metadata, dependency list, or worktree binding.',
+    'description': 'Update a persistent task status, metadata, or dependency list.',
     'input_schema': {
         'type': 'object',
         'properties': {
@@ -151,7 +150,6 @@ TASK_UPDATE_TOOL = {
             'removeBlockedBy': {'type': 'array', 'items': {'type': 'integer'}},
             'owner': {'type': 'string'},
             'description': {'type': 'string'},
-            'worktree': {'type': 'string'},
         },
         'required': ['task_id'],
     },
@@ -205,20 +203,6 @@ TASK_PRUNE_COMPLETED_TOOL = {
             'olderThanDays': {'type': 'integer'},
             'archive': {'type': 'boolean'},
         },
-    },
-}
-
-TASK_BIND_WORKTREE_TOOL = {
-    'name': 'task_bind_worktree',
-    'description': 'Bind a persistent task to a worktree name without creating the worktree itself.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'task_id': {'type': 'integer'},
-            'worktree': {'type': 'string'},
-            'owner': {'type': 'string'},
-        },
-        'required': ['task_id', 'worktree'],
     },
 }
 
@@ -354,82 +338,6 @@ CLAIM_TASK_TOOL = {
     },
 }
 
-WORKTREE_CREATE_TOOL = {
-    'name': 'worktree_create',
-    'description': 'Create a git worktree lane and optionally bind it to a persistent task.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'name': {'type': 'string'},
-            'task_id': {'type': 'integer'},
-            'base_ref': {'type': 'string'},
-        },
-        'required': ['name'],
-    },
-}
-
-WORKTREE_LIST_TOOL = {
-    'name': 'worktree_list',
-    'description': 'List worktrees tracked by Maggie under .worktrees/index.json.',
-    'input_schema': {'type': 'object', 'properties': {}},
-}
-
-WORKTREE_STATUS_TOOL = {
-    'name': 'worktree_status',
-    'description': 'Show git status for one named worktree.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {'name': {'type': 'string'}},
-        'required': ['name'],
-    },
-}
-
-WORKTREE_RUN_TOOL = {
-    'name': 'worktree_run',
-    'description': 'Run a shell command inside a named worktree directory.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'name': {'type': 'string'},
-            'command': {'type': 'string'},
-        },
-        'required': ['name', 'command'],
-    },
-}
-
-WORKTREE_KEEP_TOOL = {
-    'name': 'worktree_keep',
-    'description': 'Mark a worktree as kept instead of removing it during closeout.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {'name': {'type': 'string'}},
-        'required': ['name'],
-    },
-}
-
-WORKTREE_REMOVE_TOOL = {
-    'name': 'worktree_remove',
-    'description': 'Remove a worktree lane and optionally mark its bound task completed.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'name': {'type': 'string'},
-            'force': {'type': 'boolean'},
-            'complete_task': {'type': 'boolean'},
-        },
-        'required': ['name'],
-    },
-}
-
-WORKTREE_EVENTS_TOOL = {
-    'name': 'worktree_events',
-    'description': 'List recent worktree lifecycle events from .worktrees/events.jsonl.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {'limit': {'type': 'integer'}},
-    },
-}
-
 
 def tools_with_todo() -> list[dict[str, Any]]:
     return [*BASE_TOOLS, TODO_TOOL]
@@ -482,20 +390,6 @@ def tools_with_protocol_team_system() -> list[dict[str, Any]]:
 
 def tools_with_autonomous_team_system() -> list[dict[str, Any]]:
     return [*tools_with_protocol_team_system(), IDLE_TOOL, CLAIM_TASK_TOOL]
-
-
-def tools_with_worktree_system() -> list[dict[str, Any]]:
-    return [
-        *tools_with_autonomous_team_system(),
-        TASK_BIND_WORKTREE_TOOL,
-        WORKTREE_CREATE_TOOL,
-        WORKTREE_LIST_TOOL,
-        WORKTREE_STATUS_TOOL,
-        WORKTREE_RUN_TOOL,
-        WORKTREE_KEEP_TOOL,
-        WORKTREE_REMOVE_TOOL,
-        WORKTREE_EVENTS_TOOL,
-    ]
 
 
 def safe_path(workdir: Path, raw_path: str) -> Path:
@@ -577,6 +471,29 @@ def run_edit(path: str, old_text: str, new_text: str, workdir: Path) -> str:
         return f'Error: {exc}'
 
 
+def normalize_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(tool_input)
+    raw_arguments = normalized.get('raw_arguments')
+    if not isinstance(raw_arguments, str) or not raw_arguments.strip():
+        return normalized
+    try:
+        parsed = json.loads(raw_arguments)
+    except json.JSONDecodeError as exc:
+        normalized['_raw_arguments_error'] = (
+            f'Could not parse tool arguments as JSON: {exc}. '
+            'Ask the model to retry with smaller or simpler arguments.'
+        )
+        return normalized
+    if isinstance(parsed, dict):
+        merged = dict(parsed)
+        for key, value in normalized.items():
+            if key != 'raw_arguments':
+                merged[key] = value
+        return merged
+    normalized['_raw_arguments_error'] = 'Parsed raw_arguments was not a JSON object.'
+    return normalized
+
+
 def execute_tool(
     name: str,
     tool_input: dict[str, Any],
@@ -588,9 +505,12 @@ def execute_tool(
     message_bus: Any | None = None,
     teammate_manager: Any | None = None,
     protocol_registry: Any | None = None,
-    worktree_manager: WorktreeManager | None = None,
     current_agent_name: str = 'lead',
 ) -> str:
+    tool_input = normalize_tool_input(tool_input)
+    if '_raw_arguments_error' in tool_input:
+        return f"Error: {tool_input['_raw_arguments_error']}"
+
     def handle_shutdown_request() -> str:
         if protocol_registry is None or message_bus is None:
             return 'Error: Shutdown protocol unavailable'
@@ -678,7 +598,6 @@ def execute_tool(
             remove_blocked_by=tool_input.get('removeBlockedBy'),
             owner=tool_input.get('owner'),
             description=tool_input.get('description'),
-            worktree=tool_input.get('worktree'),
         ) if task_manager is not None else 'Error: Task manager unavailable',
         'task_list': lambda: task_manager.list_all(str(tool_input.get('filter', 'all'))) if task_manager is not None else 'Error: Task manager unavailable',
         'task_get': lambda: task_manager.get(int(tool_input['task_id'])) if task_manager is not None else 'Error: Task manager unavailable',
@@ -687,11 +606,6 @@ def execute_tool(
         'task_prune_completed': lambda: task_manager.prune_completed(
             int(tool_input.get('olderThanDays', 30)),
             archive=bool(tool_input.get('archive', True)),
-        ) if task_manager is not None else 'Error: Task manager unavailable',
-        'task_bind_worktree': lambda: task_manager.bind_worktree(
-            int(tool_input['task_id']),
-            str(tool_input['worktree']),
-            str(tool_input.get('owner', '')),
         ) if task_manager is not None else 'Error: Task manager unavailable',
         'claim_task': lambda: task_manager.claim(int(tool_input['task_id']), current_agent_name) if task_manager is not None else 'Error: Task manager unavailable',
         'background_run': lambda: background_manager.run(str(tool_input['command'])) if background_manager is not None else 'Error: Background manager unavailable',
@@ -715,23 +629,13 @@ def execute_tool(
         'plan_approval': handle_plan_review if current_agent_name == 'lead' and 'approve' in tool_input else handle_plan_submit,
         'list_plan_requests': lambda: protocol_registry.list_plan_requests(str(tool_input.get('filter', 'all'))) if protocol_registry is not None else 'Error: Plan approval protocol unavailable',
         'idle': lambda: 'Entering idle phase.' if current_agent_name != 'lead' else 'Lead does not idle.',
-        'worktree_create': lambda: worktree_manager.create(
-            str(tool_input['name']),
-            int(tool_input['task_id']) if 'task_id' in tool_input and tool_input.get('task_id') is not None else None,
-            str(tool_input.get('base_ref', 'HEAD')),
-        ) if worktree_manager is not None else 'Error: Worktree manager unavailable',
-        'worktree_list': lambda: worktree_manager.list_all() if worktree_manager is not None else 'Error: Worktree manager unavailable',
-        'worktree_status': lambda: worktree_manager.status(str(tool_input['name'])) if worktree_manager is not None else 'Error: Worktree manager unavailable',
-        'worktree_run': lambda: worktree_manager.run(str(tool_input['name']), str(tool_input['command'])) if worktree_manager is not None else 'Error: Worktree manager unavailable',
-        'worktree_keep': lambda: worktree_manager.keep(str(tool_input['name'])) if worktree_manager is not None else 'Error: Worktree manager unavailable',
-        'worktree_remove': lambda: worktree_manager.remove(
-            str(tool_input['name']),
-            force=bool(tool_input.get('force', False)),
-            complete_task=bool(tool_input.get('complete_task', False)),
-        ) if worktree_manager is not None else 'Error: Worktree manager unavailable',
-        'worktree_events': lambda: worktree_manager.list_events(int(tool_input.get('limit', 20))) if worktree_manager is not None else 'Error: Worktree manager unavailable',
     }
     handler = handlers.get(name)
     if handler is None:
         return f'Unknown tool: {name}'
-    return handler()
+    try:
+        return handler()
+    except KeyError as exc:
+        return f"Error: Missing required tool argument: {exc}"
+    except Exception as exc:
+        return f'Error: {exc}'

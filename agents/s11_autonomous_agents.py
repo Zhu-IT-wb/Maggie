@@ -14,7 +14,9 @@ from maggie.autonomy import AutonomousTeammateManager
 from maggie.background import BackgroundManager
 from maggie.compression import TOKEN_THRESHOLD, auto_compact, estimate_tokens, micro_compact
 from maggie.config import load_settings
+from maggie.langgraph_runtime import langgraph_is_available, run_agent_turn
 from maggie.llm import ChatClient
+from maggie.memory import MemoryManager
 from maggie.prompts import build_system_prompt
 from maggie.session_store import SessionStore
 from maggie.skills import SkillLoader
@@ -25,8 +27,8 @@ from maggie.todo import TodoManager
 from maggie.tools import execute_tool, tools_with_autonomous_team_system
 
 
-# s11 在 s10 的协议化团队之上，再加入自治能力：空闲队友会自动轮询消息和任务板，而不是只能被动等待。
 SYSTEM_SUFFIX = (
+    'Before substantial tool use, briefly tell the user in one or two sentences what you are about to do. '
     'Use TodoWrite for short-horizon execution planning inside the current conversation. '
     'Use task_create, task_update, task_list, and task_get for persistent tasks that must survive compression and session changes. '
     'Use task_archive, task_delete, and task_prune_completed to keep the persistent task board tidy instead of letting stale tasks pile up forever. '
@@ -52,8 +54,11 @@ SUBAGENT_SYSTEM_TEMPLATE = (
 )
 
 
+def log_info(message: str) -> None:
+    print(f'[info] {message}')
+
+
 def render_text(content: list[object]) -> str:
-    # 终端展示只保留自然语言文本，不直接暴露内部协议对象。
     parts: list[str] = []
     for block in content:
         text = getattr(block, 'text', '')
@@ -62,17 +67,68 @@ def render_text(content: list[object]) -> str:
     return ''.join(parts).strip() or '(no text response)'
 
 
-def build_system_with_skills(workdir: Path, skill_loader: SkillLoader) -> str:
-    # system prompt 里只保留技能名称和简介，完整正文由 load_skill 按需加载。
-    return (
-        f"{build_system_prompt(workdir)} {SYSTEM_SUFFIX}\n\n"
-        'Skills available:\n'
-        f'{skill_loader.get_descriptions()}'
-    )
+def emit_progress_text(content: list[object]) -> None:
+    text = render_text(content)
+    if text and text != '(no text response)':
+        print(text)
+
+
+def summarize_tool_use(name: str, tool_input: dict[str, Any]) -> str | None:
+    if name == 'TodoWrite':
+        return 'Updating the current execution checklist.'
+    if name == 'task':
+        description = str(tool_input.get('description', '')).strip() or 'subtask'
+        return f'Delegating subtask: {description}'
+    if name == 'compact':
+        return 'Compacting context while preserving the current state.'
+    if name in {'write_file', 'read_file', 'edit_file'}:
+        path = str(tool_input.get('path', '')).strip()
+        action = {
+            'write_file': 'Creating file',
+            'read_file': 'Reading file',
+            'edit_file': 'Editing file',
+        }[name]
+        return f'{action}: {path}' if path else action
+    if name in {'shell', 'bash'}:
+        command = str(tool_input.get('command', '')).strip().replace('\n', ' ')
+        if len(command) > 80:
+            command = command[:77] + '...'
+        return f'Running command: {command}' if command else 'Running command.'
+    if name == 'background_run':
+        command = str(tool_input.get('command', '')).strip().replace('\n', ' ')
+        if len(command) > 80:
+            command = command[:77] + '...'
+        return f'Starting background task: {command}' if command else 'Starting background task.'
+    if name == 'load_skill':
+        skill_name = str(tool_input.get('name', '')).strip()
+        return f'Loading skill: {skill_name}' if skill_name else 'Loading skill.'
+    if name in {'task_create', 'task_update', 'task_archive', 'task_delete', 'task_prune_completed', 'task_list', 'task_get', 'claim_task'}:
+        return f'Running task-board operation: {name}'
+    if name in {'spawn_teammate', 'list_teammates', 'send_message', 'read_inbox', 'broadcast'}:
+        return f'Running team operation: {name}'
+    if name in {'shutdown_request', 'shutdown_response', 'plan_approval', 'list_plan_requests', 'idle'}:
+        return f'Running protocol action: {name}'
+    return None
+
+
+def emit_tool_progress(name: str, tool_input: dict[str, Any]) -> None:
+    summary = summarize_tool_use(name, tool_input)
+    if summary:
+        log_info(summary)
+
+
+def build_system_with_skills(workdir: Path, skill_loader: SkillLoader, memory_context: str = '') -> str:
+    parts = [
+        f"{build_system_prompt(workdir)} {SYSTEM_SUFFIX}",
+        'Skills available:',
+        skill_loader.get_descriptions(),
+    ]
+    if memory_context.strip():
+        parts.extend(['Relevant memory for this turn:', memory_context])
+    return '\n\n'.join(parts)
 
 
 def format_background_notifications(notifications: list[dict[str, str]]) -> str:
-    # 把后台任务结果压成结构化文本，方便主 agent 下一轮消费。
     lines = [
         f"[bg:{item['task_id']}] {item['status']} | {item['command']} | {item['result']}"
         for item in notifications
@@ -81,8 +137,17 @@ def format_background_notifications(notifications: list[dict[str, str]]) -> str:
 
 
 def format_team_inbox(messages: list[dict[str, Any]]) -> str:
-    # 把 lead inbox 中的新消息注入主对话，避免团队沟通脱离主上下文。
     return '<team-inbox>\n' + json.dumps(messages, ensure_ascii=False, indent=2) + '\n</team-inbox>'
+
+
+def latest_user_input(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get('role') != 'user':
+            continue
+        content = message.get('content')
+        if isinstance(content, str):
+            return content
+    return ''
 
 
 def agent_loop(
@@ -94,17 +159,38 @@ def agent_loop(
     teammate_manager: AutonomousTeammateManager,
     protocol_registry: ProtocolRegistry,
 ) -> str:
-    # 主 agent 统一管理会话、Todo、skills、后台任务、任务板和自治团队成员。
     settings = load_settings()
+    memory_manager = MemoryManager(settings.workdir, settings, log_info)
+    current_query = latest_user_input(messages)
+    memory_context = memory_manager.build_prompt_memory(session_id, current_query)
+    skill_loader = SkillLoader(settings.workdir / 'skills')
+    system = build_system_with_skills(settings.workdir, skill_loader, memory_context)
+    subagent_system = SUBAGENT_SYSTEM_TEMPLATE.format(workdir=settings.workdir)
+
+    if langgraph_is_available():
+        return run_agent_turn(
+            messages=messages,
+            session_store=session_store,
+            session_id=session_id,
+            background_manager=background_manager,
+            message_bus=message_bus,
+            teammate_manager=teammate_manager,
+            protocol_registry=protocol_registry,
+            settings=settings,
+            system=system,
+            subagent_system=subagent_system,
+            log_info=log_info,
+            memory_manager=memory_manager,
+            current_query=current_query,
+        )
+
+    log_info('LangGraph is unavailable. Falling back to the native runtime loop.')
     if not settings.api_key:
         raise RuntimeError('Missing API key. Set LLM_API_KEY or provider-specific env vars in .env')
 
     client = ChatClient(settings)
     todo = TodoManager()
     task_manager = TaskManager(settings.workdir)
-    skill_loader = SkillLoader(settings.workdir / 'skills')
-    system = build_system_with_skills(settings.workdir, skill_loader)
-    subagent_system = SUBAGENT_SYSTEM_TEMPLATE.format(workdir=settings.workdir)
     rounds_without_todo = 0
 
     while True:
@@ -121,7 +207,7 @@ def agent_loop(
         micro_compact(messages)
 
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
-            print('[auto compact triggered]')
+            log_info('Auto compact triggered.')
             messages[:] = auto_compact(
                 messages,
                 client,
@@ -139,7 +225,17 @@ def agent_loop(
         messages.append({'role': 'assistant', 'content': response.content})
         if response.stop_reason != 'tool_use':
             session_store.save_messages(session_id, messages)
-            return render_text(response.content)
+            final_text = render_text(response.content)
+            memory_manager.update_after_turn(
+                session_id=session_id,
+                user_input=current_query,
+                final_text=final_text,
+                messages=messages,
+                todo=todo,
+            )
+            return final_text
+
+        emit_progress_text(response.content)
 
         results: list[dict[str, str]] = []
         used_todo = False
@@ -149,18 +245,15 @@ def agent_loop(
             if getattr(block, 'type', None) != 'tool_use':
                 continue
 
+            emit_tool_progress(block.name, block.input)
+
             if block.name == 'task':
-                description = str(block.input.get('description', 'subtask'))
                 prompt = str(block.input.get('prompt', '')).strip()
-                print(f'> task ({description}):')
-                print(prompt[:200])
                 output = run_subagent(settings, prompt, subagent_system)
             elif block.name == 'compact':
                 manual_compact = True
                 manual_focus = str(block.input.get('focus', '')).strip()
                 output = 'Compressing conversation context.'
-                print('> compact:')
-                print(output)
             else:
                 output = execute_tool(
                     block.name,
@@ -175,8 +268,6 @@ def agent_loop(
                     protocol_registry=protocol_registry,
                     current_agent_name='lead',
                 )
-                print(f'> {block.name}:')
-                print(str(output)[:200])
                 if block.name == 'TodoWrite':
                     used_todo = True
 
@@ -189,7 +280,7 @@ def agent_loop(
         session_store.save_messages(session_id, messages)
 
         if manual_compact:
-            print('[manual compact]')
+            log_info('Manual compact triggered.')
             messages[:] = auto_compact(
                 messages,
                 client,
@@ -211,7 +302,7 @@ def start_session(
     if target_session_id:
         session_id, messages = session_store.load_session(target_session_id)
         session_store.set_latest_session(session_id)
-        print(f'[resumed session: {session_id}]')
+        log_info(f'Resumed session: {session_id}')
         return session_id, messages
 
     if resume_mode == 'latest':
@@ -219,12 +310,12 @@ def start_session(
         if restored is not None:
             session_id, messages = restored
             session_store.set_latest_session(session_id)
-            print(f'[resumed session: {session_id}]')
+            log_info(f'Resumed session: {session_id}')
             return session_id, messages
-        print('[no previous session found; starting new session]')
+        log_info('No previous session found. Starting a new session.')
 
     session_id = session_store.create_session()
-    print(f'[new session: {session_id}]')
+    log_info(f'New session: {session_id}')
     return session_id, []
 
 
@@ -256,20 +347,23 @@ def parse_resume_target(command: str) -> str | None:
     return parts[1]
 
 
-if __name__ == '__main__':
+def main() -> None:
     settings = load_settings()
     session_store = SessionStore(Path.cwd())
     background_manager = BackgroundManager(Path.cwd())
     protocol_registry = ProtocolRegistry()
     message_bus = MessageBus(Path.cwd() / '.team')
     teammate_manager = AutonomousTeammateManager(settings, Path.cwd() / '.team', message_bus, protocol_registry)
-    resume_flag = 'latest' if len(sys.argv) >= 3 and sys.argv[1:3] == ['--resume', 'latest'] else None
-    target_session_id = sys.argv[3] if len(sys.argv) >= 4 and sys.argv[1:3] == ['--resume', 'id'] else None
-    session_id, history = start_session(session_store, resume_flag, target_session_id=target_session_id)
+    memory_manager = MemoryManager(settings.workdir, settings, log_info)
+    session_id, history = start_session(
+        session_store,
+        'latest' if len(sys.argv) >= 3 and sys.argv[1:3] == ['--resume', 'latest'] else None,
+        target_session_id=sys.argv[3] if len(sys.argv) >= 4 and sys.argv[1:3] == ['--resume', 'id'] else None,
+    )
 
     while True:
         try:
-            query = input('\033[36mMaggie s11 >> \033[0m')
+            query = input('\033[36mMaggie >> \033[0m')
         except (EOFError, KeyboardInterrupt):
             break
         stripped = query.strip()
@@ -278,7 +372,6 @@ if __name__ == '__main__':
             break
         if command == '/resume latest':
             session_id, history = start_session(session_store, 'latest', current_session_id=session_id)
-            print()
             continue
         if command.startswith('/resume '):
             target = parse_resume_target(stripped)
@@ -286,38 +379,46 @@ if __name__ == '__main__':
                 session_id, history = start_session(session_store, None, target_session_id=target)
             else:
                 print('Usage: /resume <session_id> or /resume latest')
-            print()
             continue
         if command.startswith('/cleanup'):
             keep_latest = parse_cleanup_keep(command)
             print(session_store.cleanup(keep_latest=keep_latest))
-            print()
             continue
         if command == '/session':
             print(f'Current session: {session_id}')
-            print()
             continue
         if command == '/sessions':
             print_sessions(session_store)
-            print()
             continue
         if command == '/session export':
             export_path = session_store.export_session(session_id)
             print(f'Exported current session to: {export_path}')
-            print()
             continue
         if command == '/team':
             print(teammate_manager.list_all())
-            print()
             continue
         if command == '/inbox':
             inbox = message_bus.read_inbox('lead')
             print(json.dumps(inbox, ensure_ascii=False, indent=2))
-            print()
+            continue
+        if command == '/memory':
+            memories = memory_manager.list_recent_memories(limit=10)
+            if not memories:
+                print('No long-term memories.')
+                continue
+            for item in memories:
+                print(f"[{item.type}] {item.summary} | importance={item.importance} | scope={item.scope}")
+            continue
+        if command == '/working-memory':
+            snapshot = memory_manager.working_memory_snapshot(session_id)
+            print(json.dumps(snapshot.__dict__, ensure_ascii=False, indent=2))
             continue
 
         history.append({'role': 'user', 'content': query})
         session_store.save_messages(session_id, history)
         reply = agent_loop(history, session_store, session_id, background_manager, message_bus, teammate_manager, protocol_registry)
         print(reply)
-        print()
+
+
+if __name__ == '__main__':
+    main()
